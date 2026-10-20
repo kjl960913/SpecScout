@@ -1,4 +1,4 @@
-# probe_spec_code6_mini
+# SpecScout
 
 Black-box reverse engineering of a CLI program in four agent steps. Given only a gold binary and its bundled
 documentation (a ProgramBench task), a series of fresh [mini-swe-agent](https://mini-swe-agent.com) agents
@@ -135,7 +135,7 @@ bundled docs are under `/workspace`.
 ## 4. One-time setup
 
 ```sh
-B=/data/kongjiaolong/ProgramBench_Guess_and_Check        # parent directory of this framework
+B=/path/to/parent                 # the directory that contains this framework directory (SpecScout/)
 
 # 1. mini-swe-agent venv at the path launch4.sh expects
 uv venv $B/mini_driver/.venv --python 3.13
@@ -147,7 +147,7 @@ echo 'OPENAI_API_KEY=sk-...' >> ~/.config/mini-swe-agent/.env
 chmod 600 ~/.config/mini-swe-agent/.env
 
 # 3. check the framework itself (no docker, no model)
-cd $B/probe_spec_code6_mini && python3 -m unittest -v tests/test_pipeline.py
+cd $B/SpecScout && python3 -m unittest -v tests/test_pipeline.py
 
 # 4. optional: check driver + container + export on a real image with scripted agents (no model cost),
 #    see section 15
@@ -176,7 +176,7 @@ driver/launch4.sh sstadick__hck.b66c751 openai/gpt-5.5 --model-class litellm_res
 What `launch4.sh` does:
 
 1. Derives the image `programbench/<org>_1776_<name>.<commit>:task_cleanroom_v6` and the workspace
-   `../<framework dir>_<name>_<model tag>_docker` (e.g. `../probe_spec_code6_mini_htmlq_sol_docker`;
+   `../<framework dir>_<name>_<model tag>_docker` (e.g. `../SpecScout_htmlq_sol_docker`;
    the framework dir is the name of this directory). The model tag is the model name without the
    provider prefix and without a leading `gpt-6-`, so `openai/gpt-6-sol` becomes `sol` and
    `openai/gpt-5.5` stays `gpt-5.5`.
@@ -193,8 +193,8 @@ steps 2 and 3 run up to `--parallel` agents at once.
 **Local mode** (no docker, gold run directly on the host): call the driver yourself with `--gold`:
 
 ```sh
-rsync -a --exclude .git --exclude __pycache__ --exclude work ./ ../pk6_local_ws/
-cd ../pk6_local_ws && ../mini_driver/.venv/bin/python driver/drive4.py . --model openai/gpt-6-sol \
+rsync -a --exclude .git --exclude __pycache__ --exclude work ./ ../SpecScout_local_ws/
+cd ../SpecScout_local_ws && ../mini_driver/.venv/bin/python driver/drive4.py . --model openai/gpt-6-sol \
     --model-class litellm_response --gold /path/to/binary
 ```
 
@@ -226,7 +226,7 @@ exported, so docker mode is the normal way to run.
 ## 7. Monitoring a run
 
 ```sh
-W=../probe_spec_code6_mini_htmlq_sol_docker
+W=../SpecScout_htmlq_sol_docker
 tail -f $W/driver.out                     # the journal, one JSON line per event
 (cd $W && python3 pk status)              # per node: phase, number of tests, coverage gaps
 ls $W/mini_runs/                          # NNN_<label>.task.md (prompt sent) and .traj.json (trajectory)
@@ -351,11 +351,11 @@ The submission tarball holds `/workspace` after export: the original docs, `impl
 
 ## 10. Evaluating a submission
 
-Evaluation uses the ProgramBench CLI (upstream checkout, e.g. 1.2.4 at `/tmp/pb_src_v124`). Its run
-directory must contain `<instance_id>/submission.tar.gz`, which is exactly the workspace's `submission/`:
+Evaluation uses the ProgramBench CLI (an upstream checkout with `uv`, version 1.2.x; below, `$PB` is its
+path). Its run directory must contain `<instance_id>/submission.tar.gz`, which is exactly the workspace's `submission/`:
 
 ```sh
-cd /tmp/pb_src_v124
+cd $PB
 PROGRAMBENCH_DOCKER_RUN_TIMEOUT=1800 uv run programbench eval $W/submission -b 2
 uv run programbench info $W/submission            # score per instance
 ```
@@ -381,15 +381,15 @@ so far: launch a group, wait for each driver to log `done` (or die), evaluate, a
 
 ```sh
 #!/bin/bash
-B=/data/kongjiaolong/ProgramBench_Guess_and_Check; FW=probe_spec_code6_mini
+B=/path/to/parent; FW=SpecScout; PB=/path/to/programbench
 MODEL=openai/gpt-6-sol; TAG=sol; OUT=$B/results.txt
 name_of() { local n=${1#*__}; echo ${n%.*}; }
 wait_eval() {
   local iid=$1; local W=$B/${FW}_$(name_of $iid)_${TAG}_docker
   while ! grep -q '"event": "done"' $W/mini_runs/journal.jsonl 2>/dev/null && kill -0 $(cat $W/driver.pid) 2>/dev/null; do
     sleep 60; done
-  (cd /tmp/pb_src_v124 && PROGRAMBENCH_DOCKER_RUN_TIMEOUT=1800 uv run programbench eval $W/submission -b 2 > $W/submission/eval.log 2>&1)
-  echo "$(name_of $iid) | $(cd /tmp/pb_src_v124 && uv run programbench info $W/submission 2>&1 | grep __ | head -1)" >> $OUT
+  (cd $PB && PROGRAMBENCH_DOCKER_RUN_TIMEOUT=1800 uv run programbench eval $W/submission -b 2 > $W/submission/eval.log 2>&1)
+  echo "$(name_of $iid) | $(cd $PB && uv run programbench info $W/submission 2>&1 | grep __ | head -1)" >> $OUT
 }
 echo "=== $(date '+%F %T') $FW @ $(git -C $B/$FW rev-parse --short HEAD) $MODEL" >> $OUT
 for iid in mgdm__htmlq.6e31bc8 rs__jplot.2a54bcc; do
@@ -526,8 +526,8 @@ Test conditions shared by `t`, `sweep`, `batch` and `verify`:
   workspace that includes them:
 
   ```sh
-  rsync -a --exclude .git --exclude __pycache__ --exclude work ./ ../pk6_fake_ws/
-  cd ../pk6_fake_ws && ../mini_driver/.venv/bin/python driver/drive4.py . --fake-agent tests/fake \
+  rsync -a --exclude .git --exclude __pycache__ --exclude work ./ ../SpecScout_fake_ws/
+  cd ../SpecScout_fake_ws && ../mini_driver/.venv/bin/python driver/drive4.py . --fake-agent tests/fake \
       --docker-image programbench/mgdm_1776_htmlq.6e31bc8:task_cleanroom_v6
   ```
 
