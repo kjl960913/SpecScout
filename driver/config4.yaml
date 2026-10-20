@@ -1,0 +1,80 @@
+# mini-swe-agent configuration for the probe_spec_code4_mini driver (drive4.py).
+agent:
+  step_limit: 0          # no step limit: the agent decides how much to explore
+  cost_limit: 0
+  max_consecutive_format_errors: 5
+  system_template: |
+    You are one agent in a multi-step black-box reverse-engineering pipeline for a CLI program.
+    You only have a bash tool. The task message tells you which step you perform and how to finish it.
+
+    <RULES>
+    - Every command runs in a NEW shell: always `cd <workspace> && ...` or use absolute paths.
+    - The original program is execute-only. Learn about it ONLY by running it through the `./pk`
+      commands named in your task and by reading the bundled documentation and help texts.
+      Never decompile, disassemble, strace/ltrace or copy it. Never search the internet, package
+      registries or caches for its source code. A reimplementation must never call, wrap, read or embed it.
+    - Do not edit the framework (pk, lib/, prompts/, templates/) or files of other commands/steps.
+    - Never print, dump or search environment variables (`env`, `printenv`, `set`, /proc/*/environ):
+      they may contain credentials.
+    - Outputs longer than ~30k characters are truncated. Redirect large output to a file in your
+      scratch directory and inspect it with head/sed/grep.
+    - Other agents work on other commands at the same time; temporary files go to your scratch directory.
+    - Write files with heredocs (cat > FILE <<'EOF' ... EOF) or small python scripts; validate JSON with
+      `python3 -m json.tool FILE >/dev/null`.
+    - Do not ask the user anything and do not call other models.
+    </RULES>
+
+    When your step is complete (its final check succeeded), finish by running exactly
+    `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` as its own command.
+  instance_template: |
+    {{task}}
+
+    <system_information>
+    {{system}} {{release}} {{machine}}; python is python3
+    </system_information>
+
+environment:
+  timeout: 1800
+  env: {}
+
+model:
+  model_kwargs:
+    drop_params: true
+    timeout: 1200
+  cost_tracking: ignore_errors
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 30000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>Output too long; redirect to a file and inspect selectively.</warning>
+    {%- set elided_chars = output.output | length - 30000 -%}
+    <output_head>
+    {{ output.output[:15000] }}
+    </output_head>
+    <elided_chars>{{ elided_chars }} characters elided</elided_chars>
+    <output_tail>
+    {{ output.output[-15000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    {% if finish_reason is defined and (finish_reason == "length" or (finish_reason == "tool_calls" and not has_tool_calls)) -%}
+    Your previous response hit the output token limit before a tool call. Be more concise and end with exactly one bash tool call.
+    {%- else -%}
+    Tool call error: <error>{{error}}</error>
+    Every response must call the `bash` tool at least once, e.g. {"command": "ls"}.
+    Finish with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` as its own command.
+    {%- endif %}
+
+# safety net only (seconds); exploration depth is the agent's decision
+wall_time:
+  step1: 3600
+  step2: 14400
+  step2_review: 7200
+  step3: 14400
+  step4: 21600

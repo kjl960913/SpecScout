@@ -1,0 +1,8 @@
+{"entries": [
+ {"ids": ["rule:interval", "prior:interval-open"], "title": "Intervals `A..B` and `A..`",
+  "text": "`A..B` matches A up to and including B; both bounds are integers, B >= A or the command exits 2 with `error: empty interval 'A..B'`. `A..` has no upper bound. Output: one matched line per input line, unchanged, in input order."},
+ {"ids": ["vocab:unit"], "title": "Unit names",
+  "text": "Accepted unit names (sweep S01): km m cm mm in ft. Any other name: stderr `error: unknown unit 'X'`, exit 2. Names are case-sensitive (`KM` is rejected)."},
+ {"ids": ["err:unclosed-quote"], "title": "Unclosed quote",
+  "text": "A pattern with an unclosed `\"` exits 2 with `error: unterminated string at column N` (N is 1-based, points at the opening quote)."}
+]}

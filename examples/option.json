@@ -1,0 +1,25 @@
+{"option": "--width",
+ "aliases": ["-w"],
+ "blocks": [
+   {"given": "input whose largest count has fewer digits than N",
+    "when": "--width N (also -w N, --width=N)",
+    "then": "counts are right-aligned in a field of N characters instead of the width of the largest count",
+    "assert": [
+      {"id": "A1", "text": "with counts 12 and 3 and --width 5, the lines are '   12 apple' and '    3 pear'"},
+      {"id": "A2", "text": "the field never truncates: when N is smaller than the widest count, the width of the widest count is used"}
+    ],
+    "basis": ["root-t0012", "root-t0013", "root-v0002"]},
+   {"given": "any input",
+    "when": "--width 0",
+    "then": "counts are printed without padding",
+    "assert": [
+      {"id": "A3", "text": "--width 0 prints '12 apple' and '3 pear'"}
+    ],
+    "basis": ["root-t0019"]}
+ ],
+ "verify": [
+   {"assert": "A2", "test": "root-v0002", "new_aspect": "N smaller than the widest count (--width 1 with a count of 120)",
+    "verdict": "inconsistent", "reason": "the count was not truncated but the width was 1 + widest; A2 rewritten from the observed output", "revised": true},
+   {"assert": "A1", "test": "root-v0003", "new_aspect": "three-digit count and non-ASCII line text",
+    "verdict": "consistent", "reason": "padding is still computed in characters of the count only"}
+ ]}

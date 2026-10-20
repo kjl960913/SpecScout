@@ -1,0 +1,18 @@
+{"entries": [
+  {"id": "E01", "title": "Unrecognized option",
+   "causes": [
+     {"text": "a token starting with '-' that is not a documented spelling (unknown long flag, misspelled or upper-case spelling, single-dash form of a long option)", "members": ["T01"]},
+     {"text": "a flag that takes no value is given one with '=' (e.g. --sort=1)", "members": ["T07"]}
+   ]},
+  {"id": "E02", "title": "Input file cannot be read",
+   "causes": [
+     {"text": "the FILE argument does not exist (also an empty-string argument and a dangling symlink)", "members": ["T02"]},
+     {"text": "the FILE argument is a directory", "members": ["T05"]},
+     {"text": "the FILE argument is not readable", "members": ["T06"]}
+   ]},
+  {"id": "E03", "title": "Option value missing",
+   "causes": [
+     {"text": "--width is the last token", "members": ["T03"]},
+     {"text": "--width is followed by another option, which is not taken as its value", "members": ["root-r0071"]}
+   ]}
+]}

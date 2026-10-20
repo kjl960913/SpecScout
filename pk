@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""pk -- probe_spec_code6_mini command line. Run from the framework directory; state lives in ./work.
+
+Step 1   ./pk discover [BINARY]          help tree, help bytes, docs copy
+         ./pk node add WORD... | node remove SLUG
+         ./pk check 1
+Step 2   ./pk iface draft SUB | iface check SUB
+         ./pk t SUB [conditions] [--covers ID] -- ARGV...   run the gold (twice for nondeterminism), record it
+         ./pk sweep SUB --list NAME | --list-file F --covers ID [conditions] -- ARGV with {W}
+         ./pk batch SUB --cands F | --cand TEXT --covers ID [--split] [conditions] -- ARGV with {C}
+                                              guess spellings: run many candidate forms at once
+         ./pk features SUB                    checklist status (features.json + automatic items)
+         ./pk tests SUB                       one line per recorded test
+         ./pk coverage SUB                    controls, witnesses, gaps, checklist (first call runs the rule tests)
+         ./pk ready SUB                       explorer: validate everything, hand over to the review agent
+         ./pk finish SUB                      reviewer: validate again and freeze the clusters
+Step 3   ./pk spec prepare SUB | spec check SUB [--unit U] | spec build SUB
+         ./pk verify SUB --option NAME --assert ID --why TEXT [conditions] -- ARGV...
+Step 4   ./pk diff [--entry ENTRY | --test ID]
+         ./pk spec amend SUB UNIT --cite TEST --reason TEXT
+         ./pk export DEST
+Any      ./pk status
+"""
+import argparse
+import os
+import shlex
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+
+import cluster  # noqa: E402
+import discover  # noqa: E402
+import execute  # noqa: E402
+import features  # noqa: E402
+import iface as ifacemod  # noqa: E402
+import rules  # noqa: E402
+import specbuild  # noqa: E402
+import sweep as sweepmod  # noqa: E402
+import testdb  # noqa: E402
+import view  # noqa: E402
+from common import (fail, is_frozen, node, nodes, read_json, read_jsonl, sub_dir, write_json,  # noqa: E402
+                    wpath, display)
+
+
+# ----------------------------------------------------------------- helpers
+
+def _resolve_src(sub, src):
+    cands = [src] if os.path.isabs(src) else [wpath("fixtures", sub, src), os.path.abspath(src)]
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    fail(f"input file {src!r} not found (looked in work/fixtures/{sub}/ and the current directory)")
+
+
+def _decode_text(s):
+    return s.encode("utf-8").decode("unicode_escape").encode("latin-1")
+
+
+def _test_from_args(a, sub):
+    blobs = execute.Blobs()
+    files = {}
+    for spec in a.file or []:
+        name, eq, src = spec.partition("=")
+        path = _resolve_src(sub, src if eq else name)
+        if os.path.isdir(path):
+            fail(f"--file {spec}: is a directory; use --dir NAME for an empty directory")
+        with open(path, "rb") as f:
+            files[name] = blobs.put(f.read())
+    for name in a.dir or []:
+        files[name] = "@dir"
+    stdin = None
+    if a.stdin and a.stdin_text is not None:
+        fail("use either --stdin or --stdin-text")
+    if a.stdin:
+        with open(_resolve_src(sub, a.stdin), "rb") as f:
+            stdin = {"sha": blobs.put(f.read())}
+    elif a.stdin_text is not None:
+        stdin = {"sha": blobs.put(_decode_text(a.stdin_text))}
+    env = {}
+    for kv in a.env or []:
+        k, eq, v = kv.partition("=")
+        if not eq or not k:
+            fail(f"--env {kv!r}: expected NAME=VALUE")
+        env[k] = v
+    for k in a.unset or []:
+        env[k] = None
+    test = {"argv": list(a.argv), "files": files, "stdin": stdin, "env": env, "channel": a.channel,
+            "setup": [shlex.split(s) for s in a.setup or []]}
+    if a.tui is not None:
+        try:
+            cols, rows = (int(x) for x in a.tui_size.lower().split("x"))
+        except ValueError:
+            fail("--tui-size must look like 80x24")
+        test["tui"] = {"keys": a.tui.split(), "size": [cols, rows], "delay": a.tui_delay}
+        test["stdin"] = None
+    try:
+        execute.channel_name(test)
+    except ValueError as e:
+        fail(str(e))
+    return test
+
+
+def _add_conditions(p):
+    p.add_argument("--file", action="append", metavar="NAME[=SRC]",
+                   help="put work/fixtures/SUB/SRC (default NAME) into the test directory as NAME")
+    p.add_argument("--dir", action="append", metavar="NAME", help="create an empty directory NAME")
+    p.add_argument("--stdin", metavar="FILE", help="stdin from a fixture file")
+    p.add_argument("--stdin-text", metavar="TEXT", help="stdin text (\\n, \\t, \\xNN escapes)")
+    p.add_argument("--env", action="append", metavar="NAME=VALUE", help="@PROBE_DIR@/@PROBE_HOME@ expand")
+    p.add_argument("--unset", action="append", metavar="NAME")
+    p.add_argument("--channel", default="pipe", choices=list(execute.CHANNELS))
+    p.add_argument("--setup", action="append", metavar="'ARGV'", help="gold command run first, same directory")
+    p.add_argument("--tui", metavar="KEYS", help="interactive run in tmux: space-separated tmux key names "
+                   "(j Enter Up C-c Escape ...; text:abc types literal text); one screen capture per key")
+    p.add_argument("--tui-size", default="80x24", metavar="COLSxROWS")
+    p.add_argument("--tui-delay", type=float, default=0.5, metavar="SECONDS", help="wait before each capture")
+
+
+def _binary():
+    return discover.binary_path()
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_discover(a):
+    ns, docs = discover.discover(a.binary, a.docs, a.maxdepth)
+    print(f"{len(ns)} command node(s):")
+    for n in ns:
+        print(f"  {n['slug']:<24} {display(n['path'])}   help: work/{n['help_file']} (exit {n['help_exit']})")
+    print(f"{len(docs)} documentation file(s) copied to work/docs/; index draft: work/docs_index.draft.json")
+
+
+def cmd_node(a):
+    doc = read_json(wpath("subcommands.json"))
+    if a.action == "add":
+        path = a.words
+        if any(n["path"] == path for n in doc["nodes"]):
+            fail(f"{path} already present")
+        got = discover.add_node(_binary(), path, doc["nodes"])
+        write_json(wpath("subcommands.json"), doc)
+        n, text = got
+        print(f"added {n['slug']}: help via {' '.join(n['help_argv'])} exit {n['help_exit']}, {len(text)} bytes")
+    else:
+        before = len(doc["nodes"])
+        doc["nodes"] = [n for n in doc["nodes"] if n["slug"] != a.words[0] or n["slug"] == "root"]
+        if len(doc["nodes"]) == before:
+            fail(f"no removable node {a.words[0]}")
+        write_json(wpath("subcommands.json"), doc)
+        print(f"removed {a.words[0]}")
+
+
+def cmd_check(a):
+    if a.step == "1":
+        errs = discover.check()
+    elif a.step == "2":
+        errs = [] if is_frozen(a.sub) else [f"{a.sub}: not finished (run ./pk finish {a.sub})"]
+    elif a.step == "2r":
+        errs = [] if (is_frozen(a.sub) or os.path.exists(sub_dir(a.sub, "ready.json"))) else [
+            f"{a.sub}: not ready (run ./pk ready {a.sub})"]
+    elif a.step == "3":
+        errs = specbuild.validate(a.sub) or ([] if os.path.exists(sub_dir(a.sub, "SPEC.md"))
+                                            else ["SPEC.md not built (./pk spec build)"])
+    else:
+        errs = [] if os.path.isfile(wpath("impl", "compile.sh")) else ["work/impl/compile.sh missing"]
+    for e in errs:
+        print("ERROR " + e)
+    print("ok" if not errs else f"{len(errs)} problem(s)")
+    sys.exit(1 if errs else 0)
+
+
+def cmd_iface(a):
+    node(a.sub)
+    if a.action == "draft":
+        d = ifacemod.draft(a.sub)
+        write_json(sub_dir(a.sub, "interface.draft.json"), d)
+        print(f"wrote work/{a.sub}/interface.draft.json: {len(d['options'])} options, "
+              f"{len(d['positionals'])} positionals, {len(d['env_vars'])} env vars")
+        return
+    ok, errs, warns = ifacemod.check(a.sub)
+    for e in errs:
+        print("ERROR " + e)
+    for w in warns:
+        print("WARNING " + w)
+    print("interface.json ok" if ok else "interface.json has errors")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_t(a):
+    sub = a.sub
+    node(sub)
+    tag = a.tag or "explore"
+    if tag == "impl":
+        source, path = "impl", wpath("impl_tests.jsonl")
+    else:
+        if is_frozen(sub):
+            fail(f"{sub} is finished (step 2 frozen); in step 3 use ./pk verify, in step 4 use --tag impl")
+        source, path = "agent:" + tag, None
+    test = _test_from_args(a, sub)
+    extra = {"covers": list(dict.fromkeys(a.covers))} if a.covers and tag != "impl" else None
+    rec = testdb.run_and_record(sub, _binary(), [(test, source, a.note, extra)], jobs=1, path=path)[0]
+    blobs = execute.Blobs()
+    print(view.brief(rec, blobs))
+    if tag != "impl":
+        _checklist_notes(sub, [rec], blobs, a.covers or [])
+        if a.covers and (rec["exit"] != 0 or not execute.stable(rec)):
+            print(f"tip: when a spelling fails, do not try the next one alone: write 10-40 candidate spellings "
+                  f"to a file and run them at once with ./pk batch {sub} --cands FILE --covers {a.covers[0]} "
+                  f"[same options as ./pk t, with {{C}} where the candidate goes] -- ARGS")
+
+
+def _checklist_notes(sub, recs, blobs, covers):
+    added = []
+    for r in recs:
+        added += features.scan_record(sub, r, blobs)
+    if added:
+        print(f"\nNEW CHECKLIST ITEMS from this output ({len(added)}): {', '.join(added[:20])}"
+              + (" ..." if len(added) > 20 else "")
+              + f"\n  each needs a successful test (--covers ID) or {features.MIN_FAILED} failed attempts + "
+                f"an \"unreachable\" reason (vocab items: ./pk sweep); see ./pk features {sub}")
+    if covers:
+        items, _ = features.merged(sub)
+        known = {i["id"] for i in items}
+        unknown = [c for c in covers if c not in known]
+        if unknown:
+            print(f"note: --covers {', '.join(unknown)} not in the checklist yet; add the item(s) to "
+                  f"work/{sub}/features.json")
+
+
+def _analysis(sub):
+    ok, errs, _ = ifacemod.check(sub)
+    if not ok:
+        print("interface.json problems (fix them first):")
+        for e in errs:
+            print("  " + e)
+        sys.exit(1)
+    return cluster.Analysis(sub)
+
+
+def cmd_rules(a):
+    an = _analysis(a.sub)
+    an.run_missing_controls(_binary())
+    lines = rules.run(an, _binary(), an.blobs, force=a.force)
+    print("\n".join(lines))
+
+
+def cmd_coverage(a):
+    sub = a.sub
+    if is_frozen(sub):
+        fail(f"{sub} is already finished")
+    an = _analysis(sub)
+    an.run_missing_controls(_binary())
+    summary = rules.run(an, _binary(), an.blobs)
+    an.run_missing_controls(_binary())
+    state = read_json(sub_dir(sub, "coverage.json"), {"calls": 0})
+    state["calls"] += 1
+    rows, gaps = an.coverage()
+    state["gaps"] = gaps
+    features.scan_all(sub, an.tests, an.blobs)
+    write_json(sub_dir(sub, "coverage.json"), state)
+    print(an.report(summary))
+    print()
+    print(features.report(sub, an))
+    if state["calls"] == 1:
+        print("\nNext: address the gaps and every open checklist item above (and anything surprising in the "
+              f"rule tests), write work/{sub}/FINDINGS.md, then ./pk ready {sub}")
+
+
+def _gate(sub, an):
+    errs = []
+    if not os.path.exists(sub_dir(sub, "coverage.json")):
+        errs.append(f"run ./pk coverage {sub} first")
+    errs += an.relation_errors()
+    f = sub_dir(sub, "FINDINGS.md")
+    if not os.path.exists(f) or not open(f).read().strip():
+        errs.append(f"work/{sub}/FINDINGS.md missing or empty")
+    if os.path.isdir(sub_dir(sub, "sections")):
+        errs.append("step 3 already started; refusing to refreeze")
+    features.scan_all(sub, an.tests, an.blobs)
+    errs += features.gate_errors(sub, an)
+    return errs
+
+
+def cmd_ready(a):
+    sub = a.sub
+    if is_frozen(sub):
+        fail(f"{sub} is already finished")
+    an = _analysis(sub)
+    an.run_missing_controls(_binary())
+    errs = _gate(sub, an)
+    if errs:
+        for e in errs:
+            print("ERROR " + e)
+        sys.exit(1)
+    write_json(sub_dir(sub, "ready.json"), {"tests": len(an.tests)})
+    print(f"{sub} ready: {len(an.tests)} tests; checklist complete. A review agent continues and runs ./pk finish.")
+
+
+def cmd_finish(a):
+    sub = a.sub
+    an = _analysis(sub)
+    if not os.path.exists(sub_dir(sub, "ready.json")):
+        fail(f"run ./pk ready {sub} first (the explorer hands over with ready; the review agent finishes)")
+    errs = _gate(sub, an)
+    if errs:
+        for e in errs:
+            print("ERROR " + e)
+        sys.exit(1)
+    an.run_missing_controls(_binary())
+    doc = cluster.freeze(sub, an)
+    rows, gaps = doc["coverage"]["rows"], doc["coverage"]["gaps"]
+    print(f"finished {sub}: {len(an.tests)} tests, {len(doc['kept'])} kept for SPEC/differential testing, "
+          f"{len(doc['dropped'])} filtered out; {len(rows) - len(gaps)}/{len(rows)} options/env triggered; "
+          f"checklist {len(doc.get('features', []))} items")
+    for c in doc["clusters"]:
+        print(f"  {c['id']:<36} kept {len(c['kept'])}")
+
+
+def _sweep_template(a, sub, placeholder):
+    """(template, raw_files) of a sweep or batch; fails unless the placeholder appears somewhere."""
+    if a.tui is not None:
+        fail("sweep and batch do not support --tui")
+    raw_files = {}
+    for spec in a.file or []:
+        name, eq, src = spec.partition("=")
+        path = _resolve_src(sub, src if eq else name)
+        with open(path, "rb") as f:
+            raw_files[name] = f.read()
+    for name in a.dir or []:
+        raw_files[name] = "@dir"
+    stdin_raw = None
+    if a.stdin and a.stdin_text is not None:
+        fail("use either --stdin or --stdin-text")
+    if a.stdin:
+        with open(_resolve_src(sub, a.stdin), "rb") as f:
+            stdin_raw = f.read()
+    elif a.stdin_text is not None:
+        stdin_raw = _decode_text(a.stdin_text)
+    env = {}
+    for kv in a.env or []:
+        k, eq, v = kv.partition("=")
+        if not eq or not k:
+            fail(f"--env {kv!r}: expected NAME=VALUE")
+        env[k] = v
+    for k in a.unset or []:
+        env[k] = None
+    template = {"argv": list(a.argv), "env": env, "channel": a.channel,
+                "setup": [shlex.split(s) for s in a.setup or []], "_stdin_raw": stdin_raw}
+    blob_text = b"".join(v for v in raw_files.values() if v != "@dir") + (stdin_raw or b"")
+    where = " ".join(a.argv) + " ".join(raw_files) + " ".join(str(v) for v in env.values()) + " ".join(a.setup or [])
+    if placeholder not in where and placeholder.encode() not in blob_text:
+        fail(f"the template contains no {placeholder} (put it in an argument, --stdin-text, --env value, file name "
+             "or file content)")
+    return template, raw_files
+
+
+def _run_template(sub, a, words, template, raw_files, run_id, cid, placeholder, split, extra):
+    blobs = execute.Blobs()
+    items = []
+    for w in words:
+        t = sweepmod.instantiate(template, w, blobs, raw_files, placeholder, split)
+        try:
+            execute.channel_name(t)
+        except ValueError as e:
+            fail(str(e))
+        kind = "batch" if extra.get("batch") else "sweep"
+        items.append((t, kind + ":" + cid, a.note or f"{kind} {run_id} {'candidate' if kind == 'batch' else 'word'} {w!r}",
+                      {"covers": [cid], "sweep": dict(extra, run=run_id, word=w)}))
+    recs = testdb.run_and_record(sub, _binary(), items)
+    iface = ifacemod.load(sub) or {}
+    nonerror = set(iface.get("nonerror_exits") or [])
+    return recs, blobs, nonerror
+
+
+def cmd_sweep(a):
+    sub = a.sub
+    node(sub)
+    if is_frozen(sub):
+        fail(f"{sub} is finished (step 2 frozen)")
+    if not a.covers or len(a.covers) != 1:
+        fail("give exactly one --covers ID (the vocab item this sweep explores, e.g. vocab:function)")
+    if not a.list and not a.list_file:
+        fail("give --list NAME (" + ", ".join(sweepmod.list_names()) + ") and/or --list-file FILE")
+    cid = a.covers[0]
+    auto = [l for l in sweepmod.auto_lists(cid) if l not in (a.list or [])]
+    if auto:
+        a.list = (a.list or []) + auto
+        print(f"note: framework list(s) {', '.join(auto)} added to this sweep of {cid} (they hold the standard "
+              f"names; your own list adds the program-specific ones)")
+    words = sweepmod.read_words(a.list, [_resolve_src(sub, f) for f in a.list_file or []])
+    template, raw_files = _sweep_template(a, sub, sweepmod.PLACEHOLDER)
+    run_id, _ = sweepmod.next_run_id(sub)
+    recs, blobs, nonerror = _run_template(sub, a, words, template, raw_files, run_id, cid,
+                                          sweepmod.PLACEHOLDER, False, {})
+    lines, accepted = sweepmod.summary(sub, run_id, recs, blobs, nonerror)
+    sweepmod.record_run(sub, {"run": run_id, "covers": cid, "words": len(words), "accepted": accepted,
+                              "lists": a.list or [], "list_files": a.list_file or [], "argv": list(a.argv)})
+    added = features.add_auto(sub, [{"id": f"{cid}/{w}", "kind": "construct", "source": "sweep",
+                                     "description": f"word {w!r} accepted in sweep {run_id} of {cid}",
+                                     "tests": [r["id"] for r in recs if r["sweep"]["word"] == w]}
+                                    for w in accepted])
+    print("\n".join(lines))
+    print(f"recorded {len(recs)} tests ({recs[0]['id']} .. {recs[-1]['id']}); the {len(accepted)} accepted words are "
+          f"covered checklist items {cid}/WORD ({len(added)} new). Outputs: ./pk tests {sub} --sweep {run_id}")
+    _checklist_notes(sub, recs, blobs, [])
+
+
+def cmd_batch(a):
+    sub = a.sub
+    node(sub)
+    if is_frozen(sub):
+        fail(f"{sub} is finished (step 2 frozen)")
+    if not a.covers or len(a.covers) != 1:
+        fail("give exactly one --covers ID (the checklist item whose spelling this batch guesses)")
+    if not a.cands and not a.cand:
+        fail("give --cands FILE (one candidate per line, or blocks separated by lines '---') and/or --cand TEXT")
+    cands = sweepmod.read_candidates([_resolve_src(sub, f) for f in a.cands or []], a.cand)
+    template, raw_files = _sweep_template(a, sub, sweepmod.CAND)
+    if a.split and sweepmod.CAND not in a.argv:
+        fail("--split needs an argument that is exactly {C}")
+    run_id, _ = sweepmod.next_run_id(sub, "B")
+    cid = a.covers[0]
+    recs, blobs, nonerror = _run_template(sub, a, cands, template, raw_files, run_id, cid,
+                                          sweepmod.CAND, a.split, {"batch": True})
+    lines, accepted = sweepmod.summary(sub, run_id, recs, blobs, nonerror, batch=True)
+    sweepmod.record_run(sub, {"run": run_id, "kind": "batch", "covers": cid, "words": len(cands),
+                              "accepted": accepted, "list_files": a.cands or [], "argv": list(a.argv)})
+    print("\n".join(lines))
+    print(f"recorded {len(recs)} tests ({recs[0]['id']} .. {recs[-1]['id']}), all linked to {cid}; kept for the "
+          f"SPEC: every accepted candidate and representatives of each rejection. "
+          f"Outputs: ./pk tests {sub} --sweep {run_id}")
+    _checklist_notes(sub, recs, blobs, [])
+
+
+def cmd_features(a):
+    an = _analysis(a.sub)
+    features.scan_all(a.sub, an.tests, an.blobs)
+    print(features.report(a.sub, an, full=not a.open))
+
+
+def cmd_tests(a):
+    an = _analysis(a.sub)
+    blobs = an.blobs
+    n = 0
+    for r in an.tests:
+        if a.sweep and (r.get("sweep") or {}).get("run") != a.sweep:
+            continue
+        if not a.sweep and r.get("sweep") and not a.all:
+            continue
+        if a.source and not r["source"].startswith(a.source):
+            continue
+        stdin = ""
+        if r.get("stdin"):
+            stdin = " <" + view.text(blobs.get(r["stdin"]["sha"]), 50).replace("\n", "\\n")
+        out = (blobs.get(r["stdout_sha"]) or b"").decode("utf-8", "replace").strip().splitlines()
+        err = (blobs.get(r["stderr_sha"]) or b"").decode("utf-8", "replace").strip().splitlines()
+        first = (out[0] if out else "") or (("stderr: " + err[0]) if err else "(no output)")
+        cov = (" covers=" + ",".join(r["covers"])) if r.get("covers") else ""
+        print(f"{r['id']} [{r['source']}] {an.side[r['id']]} exit={r['exit']} "
+              f"{view.argv_str(r['argv'])[:90]}{stdin}{cov} -> {first[:90]}")
+        n += 1
+    if not a.all and not a.sweep:
+        k = sum(1 for r in an.tests if r.get("sweep"))
+        if k:
+            print(f"({k} sweep word tests not listed: --all or --sweep RUN)")
+    print(f"{n} test(s)")
+
+
+def cmd_spec(a):
+    sub = a.sub
+    node(sub)
+    if a.action == "prepare":
+        listing = specbuild.prepare(sub)
+        for u in listing:
+            print(f"  {u['unit']:<36} evidence work/{sub}/{u['evidence']}  ->  write work/{sub}/{u['write']}")
+        return
+    if a.action == "check":
+        errs = specbuild.validate(sub, a.unit)
+    elif a.action == "build":
+        errs = specbuild.build(sub)
+    else:
+        errs = specbuild.amend(sub, a.unit, a.cite, a.reason)
+    for e in errs:
+        print("ERROR " + e)
+    if errs:
+        sys.exit(1)
+    print({"check": "ok", "build": f"wrote work/{sub}/SPEC.md and entry_index.json",
+           "amend": f"amended {a.unit}; SPEC.md rebuilt"}[a.action])
+
+
+def cmd_verify(a):
+    sub = a.sub
+    if not is_frozen(sub):
+        fail(f"{sub}: step 2 not finished")
+    iface = ifacemod.load(sub)
+    if a.option not in [o["name"] for o in iface["options"]]:
+        fail(f"unknown option {a.option}; use the canonical name from interface.json")
+    source = f"verify:{a.option}:{a.assert_id}"
+    tests = testdb.by_id(sub)
+    if any(r["source"] == source for r in tests.values()):
+        fail(f"{a.option} {a.assert_id} was already verified once")
+    test = _test_from_args(a, sub)
+    sec = read_json(sub_dir(sub, "sections", specbuild.opt_file(a.option) + ".json"))
+    basis = set()
+    for b in (sec or {}).get("blocks", []) if isinstance(sec, dict) else []:
+        basis.update(t for t in b.get("basis", []) if t in tests)
+    if not basis:
+        cl = read_json(sub_dir(sub, "clusters.json"))
+        c = next((c for c in cl["clusters"] if c["id"] == "option:" + a.option), {})
+        basis = {p["test"] for p in c.get("witness", [])}
+    key = testdb.input_key(test)
+    same = [t for t in basis if testdb.input_key(tests[t]) == key]
+    if same:
+        fail(f"this input is identical to basis test {same[0]}; construct an input the basis did not consider")
+    rec = testdb.run_and_record(sub, _binary(), [(test, source, a.why, {"verify": {
+        "option": a.option, "assert": a.assert_id, "why": a.why}})], jobs=1)[0]
+    print(view.brief(rec, execute.Blobs()))
+    an = cluster.Analysis(sub)
+    an.run_missing_controls(_binary())
+    cid = an.is_witness(rec["id"], a.option)
+    if a.option in an.parsed[rec["id"]]["options"]:
+        print(f"effect of {a.option} visible: " + (f"yes (differs from control {cid})" if cid else "no"))
+    print(f"\nJudge it against assert {a.assert_id}; record it in the option's \"verify\" list "
+          f"(test {rec['id']}, verdict consistent|inconsistent, reason).")
+
+
+def cmd_diff(a):
+    import difftest
+    if a.entry or a.test:
+        rows = difftest.latest()
+        if not rows:
+            fail("no differential run yet; run ./pk diff")
+        if a.test:
+            rows = [r for r in rows if r["id"] == a.test]
+        else:
+            rows = [r for r in rows if a.entry in r["entries"] and not r["pass"]]
+        if not rows:
+            print("nothing failing there in the latest run")
+        blobs = execute.Blobs()
+        for r in rows[:a.limit]:
+            print(difftest.detail(r, blobs) if not r["pass"] else f"{r['id']}: passes")
+            print()
+        if len(rows) > a.limit:
+            print(f"... {len(rows) - a.limit} more (--limit)")
+        return
+    rows, text = difftest.run(a.jobs)
+    print(text)
+    sys.exit(0 if rows is not None else 1)
+
+
+def cmd_export(a):
+    import export
+    print("exported to " + export.export(a.dest))
+
+
+def cmd_status(a):
+    for n in nodes():
+        s = n["slug"]
+        tests = len(read_jsonl(sub_dir(s, "tests.jsonl")))
+        st = ("SPEC built" if os.path.exists(sub_dir(s, "SPEC.md")) else
+              "step 3" if os.path.isdir(sub_dir(s, "sections")) else
+              "frozen" if is_frozen(s) else
+              "exploring" if tests else "-")
+        cov = read_json(sub_dir(s, "coverage.json"), {})
+        if st == "exploring" and os.path.exists(sub_dir(s, "ready.json")):
+            st = "review"
+        print(f"{s:<24} {st:<11} tests {tests:<5} coverage calls {cov.get('calls', 0)}, "
+              f"gaps {len(cov.get('gaps', []))}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pk", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    p = sp.add_parser("discover")
+    p.add_argument("binary", nargs="?", default="/workspace/executable")
+    p.add_argument("--docs", help="documentation root (default: the binary's directory)")
+    p.add_argument("--maxdepth", type=int, default=3)
+    p.set_defaults(fn=cmd_discover)
+    p = sp.add_parser("node")
+    p.add_argument("action", choices=["add", "remove"])
+    p.add_argument("words", nargs="+")
+    p.set_defaults(fn=cmd_node)
+    p = sp.add_parser("check")
+    p.add_argument("step", choices=["1", "2", "2r", "3", "4"])
+    p.add_argument("sub", nargs="?")
+    p.set_defaults(fn=cmd_check)
+    p = sp.add_parser("iface")
+    p.add_argument("action", choices=["draft", "check"])
+    p.add_argument("sub")
+    p.set_defaults(fn=cmd_iface)
+    p = sp.add_parser("t")
+    p.add_argument("sub")
+    p.add_argument("--note", default="")
+    p.add_argument("--tag", help="2.1 .. 2.5, lang, tui, iface, review, explore (default) or impl (step 4)")
+    p.add_argument("--covers", action="append", metavar="ID", help="checklist item(s) this test exercises")
+    _add_conditions(p)
+    p.set_defaults(fn=cmd_t)
+    p = sp.add_parser("sweep")
+    p.add_argument("sub")
+    p.add_argument("--list", action="append", metavar="NAME", help="framework word list templates/wordlists/NAME.txt")
+    p.add_argument("--list-file", action="append", metavar="FILE", help="own word list, one word per line")
+    p.add_argument("--covers", action="append", metavar="ID", help="the vocab checklist item")
+    p.add_argument("--note", default="")
+    _add_conditions(p)
+    p.set_defaults(fn=cmd_sweep)
+    p = sp.add_parser("batch")
+    p.add_argument("sub")
+    p.add_argument("--cands", action="append", metavar="FILE",
+                   help="candidates, one per line (or blocks separated by lines '---' for multi-line ones)")
+    p.add_argument("--cand", action="append", metavar="TEXT", help="one candidate (repeatable)")
+    p.add_argument("--split", action="store_true", help="an argument that is exactly {C} becomes several arguments")
+    p.add_argument("--covers", action="append", metavar="ID", help="the checklist item")
+    p.add_argument("--note", default="")
+    _add_conditions(p)
+    p.set_defaults(fn=cmd_batch)
+    p = sp.add_parser("features")
+    p.add_argument("sub")
+    p.add_argument("--open", action="store_true", help="only open items")
+    p.set_defaults(fn=cmd_features)
+    p = sp.add_parser("tests")
+    p.add_argument("sub")
+    p.add_argument("--source", help="prefix of the source, e.g. agent: or rule:")
+    p.add_argument("--sweep", metavar="RUN", help="only the word tests of one sweep run (S01 ...)")
+    p.add_argument("--all", action="store_true", help="include sweep word tests")
+    p.set_defaults(fn=cmd_tests)
+    p = sp.add_parser("rules")
+    p.add_argument("sub")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_rules)
+    for name, fn in (("coverage", cmd_coverage), ("ready", cmd_ready), ("finish", cmd_finish)):
+        p = sp.add_parser(name)
+        p.add_argument("sub")
+        p.set_defaults(fn=fn)
+    p = sp.add_parser("spec")
+    p.add_argument("action", choices=["prepare", "check", "build", "amend"])
+    p.add_argument("sub")
+    p.add_argument("unit", nargs="?")
+    p.add_argument("--unit", dest="unit_opt")
+    p.add_argument("--cite")
+    p.add_argument("--reason", default="")
+    p.set_defaults(fn=cmd_spec)
+    p = sp.add_parser("verify")
+    p.add_argument("sub")
+    p.add_argument("--option", required=True)
+    p.add_argument("--assert", dest="assert_id", required=True)
+    p.add_argument("--why", required=True, help="what is new about this input compared with the basis")
+    _add_conditions(p)
+    p.set_defaults(fn=cmd_verify)
+    p = sp.add_parser("diff")
+    p.add_argument("--entry")
+    p.add_argument("--test")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--jobs", type=int)
+    p.set_defaults(fn=cmd_diff)
+    p = sp.add_parser("export")
+    p.add_argument("dest")
+    p.set_defaults(fn=cmd_export)
+    p = sp.add_parser("status")
+    p.set_defaults(fn=cmd_status)
+    args, program_argv = sys.argv[1:], None
+    if args and args[0] in ("t", "verify", "sweep", "batch"):
+        if "--" not in args:
+            fail("put the program's arguments after a lone --, e.g. ./pk t root --file a.txt -- -n a.txt "
+                 "(./pk t root -- for a bare invocation)")
+        k = args.index("--")
+        args, program_argv = args[:k], args[k + 1:]
+    # option names start with '-': glue them to their flag so argparse does not take them for options
+    fixed = []
+    for k, x in enumerate(args):
+        if k and args[k - 1] in ("--option",) and x.startswith("-"):
+            fixed[-1] = "--option=" + x
+        else:
+            fixed.append(x)
+    a = ap.parse_args(fixed)
+    if program_argv is not None:
+        a.argv = program_argv
+    if a.cmd == "spec":
+        a.unit = a.unit or a.unit_opt
+        if a.action == "amend" and (not a.unit or not a.cite):
+            fail("spec amend needs UNIT and --cite TEST")
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+{"entries": [
+  {"a": "--json", "b": "--csv",
+   "description": "Both orders are rejected before any input is read: exit status 2 with the message \"error: --json and --csv are mutually exclusive\" on stderr and nothing on stdout. Each option alone succeeds on the same input."}
+]}

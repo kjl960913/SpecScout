@@ -1,0 +1,15 @@
+{
+ "entries": [
+  {
+   "a": "--count-only",
+   "b": "--width",
+   "dominant": "--count-only",
+   "description": "--count-only prints only the number of distinct lines; --width has no effect on that output in either order."
+  },
+  {
+   "a": "--sep",
+   "b": "--width",
+   "description": "--sep alone changes nothing; together with --width it replaces the padding spaces between the count field and the line by the given string."
+  }
+ ]
+}
